@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
@@ -40,6 +41,9 @@ static void on_stream_recv(sqmp_stream_t *stream,
         break;
     case SQMP_MSG_TYPE_AUTH_RESP:
         sqmp_process_auth_resp(stream, session, pkt);
+        break;
+    case SQMP_MSG_TYPE_CHAT_DELIVER:
+        sqmp_process_chat_deliver(stream, session, pkt);
         break;
     default:
         fprintf(stderr, "unhandled msg_type 0x%02x\n", pkt->msg_type);
@@ -114,11 +118,40 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     return 0;
 }
 
+static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
+                     const char *msg, size_t msglen)
+{
+    size_t   pktlen = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_send_t) + msglen;
+    uint8_t *buf    = calloc(1, pktlen);
+    if (!buf) return -1;
+
+    sqmp_pkt_t           *pkt  = (sqmp_pkt_t *)buf;
+    sqmp_msg_chat_send_t *chat = (sqmp_msg_chat_send_t *)pkt->msg;
+
+    pkt->version    = 1;
+    pkt->msg_type   = SQMP_MSG_TYPE_CHAT_SEND;
+    pkt->session_id = session->session_id;
+
+    chat->recipient_len  = session->username_len;
+    memcpy(chat->recipient, session->username, session->username_len);
+    chat->ciphertext_len = (uint32_t)msglen;
+    memcpy(chat->ciphertext, msg, msglen);
+
+    int ret = sqmp_stream_send(stream, buf, pktlen);
+    free(buf);
+    return ret;
+}
+
+/* --------------------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------------------*/
+
 int main(void)
 {
     sqmp_session_t session = {0};
     session.state = SQMP_SESSION_STATE_HELLO;
     sem_init(&session.login_ready, 0, 0);
+    sem_init(&session.auth_done, 0, 0);
 
     sigset_t sigset;
     sigemptyset(&sigset);
@@ -185,8 +218,26 @@ int main(void)
     if (!g_interrupted)
         sqmp_login(stream, &session);
 
-    while (!g_interrupted)
-        pause();
+    while (sem_wait(&session.auth_done) == -1 && errno == EINTR && !g_interrupted)
+        ;
+
+    if (!g_interrupted && session.auth_ok) {
+        printf("Logged in. Type messages and press Enter to send:\n");
+        fflush(stdout);
+
+        char line[1024];
+        while (!g_interrupted) {
+            if (!fgets(line, sizeof(line), stdin)) break;
+            if (g_interrupted) break;
+
+            size_t len = strlen(line);
+            if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
+            if (len == 0) continue;
+
+            if (send_chat(stream, &session, line, len) != 0)
+                fprintf(stderr, "failed to send message\n");
+        }
+    }
 
     printf("\nInterrupted, disconnecting...\n");
     fflush(stdout);
@@ -194,5 +245,6 @@ int main(void)
     sqmp_quic_disconnect(conn);
     sqmp_quic_destroy(ctx);
     sem_destroy(&session.login_ready);
+    sem_destroy(&session.auth_done);
     return 0;
 }

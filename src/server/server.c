@@ -106,6 +106,9 @@ static void on_stream_recv(sqmp_stream_t *stream,
     case SQMP_MSG_TYPE_AUTH_REQ:
         sqmp_process_auth_req(stream, session, pkt);
         break;
+    case SQMP_MSG_TYPE_CHAT_SEND:
+        sqmp_process_chat_send(stream, session, pkt);
+        break;
     default:
         fprintf(stderr, "unhandled msg_type 0x%02x\n", pkt->msg_type);
         break;

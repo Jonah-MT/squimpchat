@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static _Atomic uint32_t g_next_session_id = 1;
 
@@ -101,11 +102,62 @@ void sqmp_process_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
 {
     (void)stream;
     sqmp_msg_auth_resp_t *resp = (sqmp_msg_auth_resp_t *)pkt->msg;
-    if (resp->status == SQMP_AUTH_STATUS_OK) {
-        session->state = SQMP_SESSION_STATE_CONN_ESTABLISHED;
-        printf("Authentication successful (session %u)\n", resp->session_id);
+
+    if (session->state == SQMP_SESSION_STATE_AUTH) {
+        if (resp->status == SQMP_AUTH_STATUS_OK) {
+            session->state   = SQMP_SESSION_STATE_CONN_ESTABLISHED;
+            session->auth_ok = 1;
+            printf("Authentication successful (session %u)\n", resp->session_id);
+        } else {
+            session->auth_ok = 0;
+            printf("Authentication failed (status 0x%02x)\n", resp->status);
+        }
     } else {
-        printf("Authentication failed (status 0x%02x)\n", resp->status);
+        fprintf(stderr, "AUTH_RESP in unexpected state %d\n", session->state);
     }
     fflush(stdout);
+    sem_post(&session->auth_done);
+}
+
+
+void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
+{
+    (void)stream;
+    sqmp_msg_chat_deliver_t *msg = (sqmp_msg_chat_deliver_t *)pkt->msg;
+    if (session->state == SQMP_SESSION_STATE_CONN_ESTABLISHED) {
+        printf("[from: ");
+        fflush(stdout);
+        write(STDOUT_FILENO, msg->sender, msg->sender_len);
+        printf("] ");
+        fflush(stdout);
+        write(STDOUT_FILENO, msg->ciphertext, msg->ciphertext_len);
+        printf("\n");
+    } else {
+        fprintf(stderr, "CHAT_DELIVER in unexpected state %d\n", session->state);
+    }
+    fflush(stdout);
+}
+
+void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt) {
+    sqmp_msg_chat_send_t *msg = (sqmp_msg_chat_send_t *)pkt->msg;
+    sqmp_pkt_t *deliver_pkt = (sqmp_pkt_t *)malloc(sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_deliver_t) + msg->ciphertext_len);
+    sqmp_msg_chat_deliver_t *echo = (sqmp_msg_chat_deliver_t *)deliver_pkt->msg;
+
+    if (session->state == SQMP_SESSION_STATE_CONN_ESTABLISHED) {
+        deliver_pkt->session_id = pkt->session_id;
+        deliver_pkt->msg_type = SQMP_MSG_TYPE_CHAT_DELIVER;
+
+        echo->ciphertext_len = msg->ciphertext_len;
+        memcpy(echo->ciphertext, msg->ciphertext, msg->ciphertext_len);
+
+        echo->sender_len = msg->recipient_len;
+        memcpy(echo->sender, msg->recipient, msg->recipient_len);
+
+        sqmp_stream_send(stream, (uint8_t *)deliver_pkt, sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_deliver_t) + msg->ciphertext_len);
+
+    } else {
+        fprintf(stderr, "CHAT_SEND in unexpected state %d\n", session->state);
+    }
+
+    free(deliver_pkt);
 }

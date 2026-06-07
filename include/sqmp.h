@@ -15,11 +15,14 @@ typedef struct sqmp_session_s {
     uint8_t  username[SQMP_USERNAME_MAX_LEN];
     sem_t    login_ready;
 
+    sem_t    auth_done;  /* posted by sqmp_process_auth_resp; client main blocks on this */
+    uint8_t  auth_ok;   /* set by sqmp_process_auth_resp before posting auth_done */
+
     struct sqmp_stream_s   *auth_stream;
     uint8_t                 auth_username_len;
     uint8_t                 auth_username[SQMP_USERNAME_MAX_LEN];
     uint8_t                 auth_password_hash[SQMP_PASSWORD_HASH_LEN];
-    struct sqmp_session_s  *next; // auth queue linkage
+    struct sqmp_session_s  *next; /* auth queue linkage */
 } sqmp_session_t;
 
 enum sqmp_session_state_e {
@@ -147,10 +150,12 @@ enum sqmp_auth_status_e {
     SQMP_AUTH_STATUS_INVALID = 0x01,
 };
 
-void sqmp_process_hello    (sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_hello(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_process_hello_ack(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
-void sqmp_process_auth_req (sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_process_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 
-void sqmp_auth_queue_init    (void);
+void sqmp_auth_queue_init(void);
 sqmp_session_t *sqmp_auth_queue_dequeue (void);
