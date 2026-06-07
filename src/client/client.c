@@ -13,15 +13,26 @@
 #include <termios.h>
 #include "debug.h"
 #include <unistd.h>
+#include <readline/readline.h>
 
 static volatile sig_atomic_t g_interrupted;
 static pthread_t             g_main_thread;
 static _Atomic int           g_conn_alive = 1;
+static _Atomic int           g_readline_active = 0;
 
 static void sig_handler(int sig)
 {
     (void)sig;
     g_interrupted = 1;
+}
+
+static int rl_interrupt_hook(void)
+{
+    if (g_interrupted) {
+        rl_replace_line("", 0);
+        rl_done = 1;
+    }
+    return 0;
 }
 
 static void on_connected(sqmp_conn_t *conn)
@@ -67,8 +78,11 @@ static void on_stream_recv(sqmp_stream_t *stream,
 static void on_disconnected(sqmp_conn_t *conn)
 {
     (void)conn;
+    int rl_active = atomic_load(&g_readline_active);
+    if (rl_active) rl_clear_visible_line();
     printf("Disconnected from server\n");
     fflush(stdout);
+    if (rl_active) rl_forced_update_display();
     atomic_store(&g_conn_alive, 0);
     g_interrupted = 1;
     pthread_kill(g_main_thread, SIGINT);
@@ -148,7 +162,6 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     }
     dbg_printf("[sent] MSG_AUTH_REQ (user='%.*s')\n", (int)ulen, username);
 
-    printf("AUTH_REQ sent for '%.*s'\n", (int)ulen, username);
     fflush(stdout);
     return 0;
 }
@@ -307,21 +320,24 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session,
         return;
     }
 
-    printf("[from: %.*s] ciphertext: ", (int)msg->sender_len, msg->sender);
-    for (uint32_t i = 0; i < msg->ciphertext_len; i++)
-        printf("%02x", msg->ciphertext[i]);
+    int rl_active = atomic_load(&g_readline_active);
+    if (rl_active) rl_clear_visible_line();
+
+    printf("[from: %.*s] ", (int)msg->sender_len, msg->sender);
 
     if (msg->enc_key_len != 32 || msg->ciphertext_len < 16) {
-        printf(" text: (cannot decrypt)\n");
+        printf("ERROR: cannot decrypt\n");
         fflush(stdout);
+        if (rl_active) rl_forced_update_display();
         return;
     }
 
     uint32_t plaintext_len = msg->ciphertext_len - 16;
     uint8_t *plaintext     = malloc(plaintext_len + 1);
     if (!plaintext) {
-        printf(" text: (alloc error)\n");
+        printf("ERROR: alloc error\n");
         fflush(stdout);
+        if (rl_active) rl_forced_update_display();
         return;
     }
 
@@ -329,12 +345,13 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session,
                      msg->ciphertext, msg->ciphertext_len,
                      plaintext, &plaintext_len) == 0) {
         plaintext[plaintext_len] = '\0';
-        printf(" text: %.*s\n", (int)plaintext_len, (char *)plaintext);
+        printf("%.*s\n", (int)plaintext_len, (char *)plaintext);
     } else {
-        printf(" text: (decrypt failed)\n");
+        printf("ERROR: decrypt failed\n");
     }
     free(plaintext);
     fflush(stdout);
+    if (rl_active) rl_forced_update_display();
 }
 
 static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
@@ -493,25 +510,46 @@ int main(void)
         ;
 
     if (!g_interrupted && session.auth_ok) {
-        printf("Logged in. Type messages and press Enter to send:\n");
+
+        printf("\n\n");
+        printf("-----------------------------------------------------\n");
+        printf(" ___            _             ___ _         _     \n");
+        printf("/ __| __ _ _  _(_)_ __  _ __ / __| |_  __ _| |_   \n");
+        printf("\\__ \\/ _` | || | | '  \\| '_ \\ (__| ' \\/ _` |  _|  \n");
+        printf("|___/\\__, |\\_,_|_|_|_|_| .__/\\___|_||_\\__,_|\\__|  \n");
+        printf("        |_|            |_|                        \n");
+        printf("-----------------------------------------------------\n");
+        printf("Logged in. Type '<username> <message>' and press Enter to send:\n");
+        printf("Enter \"exit\", enter \"quit\", or press Ctrl+C to exit\n");
         fflush(stdout);
 
-        printf("Usage: <username> <message>\n");
-        fflush(stdout);
+        rl_catch_signals = 0;
+        rl_event_hook    = rl_interrupt_hook;
+        rl_set_keyboard_input_timeout(100000);
+        atomic_store(&g_readline_active, 1);
 
-        char line[1024];
+        char *line = NULL;
         while (!g_interrupted) {
-            if (!fgets(line, sizeof(line), stdin)) break;
-            if (g_interrupted) break;
+            line = readline("> ");
+            if (!line) break;
+
+            printf("\033[1A\033[2K\r");
+            fflush(stdout);
 
             size_t len = strlen(line);
-            if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
-            if (len == 0) continue;
+            if (len == 0) { free(line); line = NULL; continue; }
+
+            if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
+                free(line);
+                line = NULL;
+                break;
+            }
 
             char *space = strchr(line, ' ');
             if (!space || space == line || *(space + 1) == '\0') {
                 printf("Usage: <username> <message>\n");
                 fflush(stdout);
+                free(line); line = NULL;
                 continue;
             }
 
@@ -521,12 +559,18 @@ int main(void)
 
             if (recipient_len > SQMP_USERNAME_MAX_LEN) {
                 fprintf(stderr, "recipient name too long\n");
+                free(line); line = NULL;
                 continue;
             }
 
             if (send_chat(stream, &session, line, recipient_len, msg, msglen) != 0)
                 fprintf(stderr, "failed to send message\n");
+
+            free(line);
+            line = NULL;
         }
+        if (line) free(line);
+        atomic_store(&g_readline_active, 0);
     }
 
     printf("\nDisconnecting...\n");

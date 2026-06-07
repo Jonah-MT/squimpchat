@@ -259,7 +259,6 @@ void sqmp_process_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
         if (resp->status == SQMP_AUTH_STATUS_OK) {
             session->state   = SQMP_SESSION_STATE_CONN_ESTABLISHED;
             session->auth_ok = 1;
-            printf("Authentication successful (session %u)\n", resp->session_id);
         } else {
             session->auth_ok = 0;
             printf("Authentication failed (status 0x%02x)\n", resp->status);

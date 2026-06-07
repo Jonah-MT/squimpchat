@@ -16,7 +16,7 @@ SQMP     = src/shared/sqmp.c
 
 .PHONY: all clean
 
-all: $(BIN_DIR)/server $(BIN_DIR)/client
+all: $(BIN_DIR)/server $(BIN_DIR)/client data/sqmp-add-user
 
 $(CERT_CRT) $(CERT_KEY):
 	mkdir -p $(CERT_DIR)
@@ -31,7 +31,10 @@ $(BIN_DIR)/server: src/server/server.c $(WRAPPER) $(SQMP) $(MSQUIC) \
 	$(CC) $(CFLAGS) -o $@ src/server/server.c $(WRAPPER) $(SQMP) $(LDFLAGS)
 
 $(BIN_DIR)/client: src/client/client.c $(WRAPPER) $(SQMP) $(MSQUIC) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ src/client/client.c $(WRAPPER) $(SQMP) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ src/client/client.c $(WRAPPER) $(SQMP) $(LDFLAGS) -lreadline
+
+data/sqmp-add-user: data/sqmp_add_user.c
+	$(CC) $(CFLAGS) -o $@ $< -lcrypto
 
 clean:
-	rm -f $(BIN_DIR)/server $(BIN_DIR)/client
+	rm -f $(BIN_DIR)/server $(BIN_DIR)/client data/sqmp-add-user
