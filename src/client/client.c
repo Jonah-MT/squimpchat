@@ -1,7 +1,9 @@
 #include "client.h"
 #include "sqmp.h"
 #include <errno.h>
+#include <time.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <pthread.h>
 #include <signal.h>
@@ -9,9 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include "debug.h"
 #include <unistd.h>
 
 static volatile sig_atomic_t g_interrupted;
+static pthread_t             g_main_thread;
+static _Atomic int           g_conn_alive = 1;
 
 static void sig_handler(int sig)
 {
@@ -36,19 +41,26 @@ static void on_stream_recv(sqmp_stream_t *stream,
     sqmp_session_t *session = sqmp_stream_get_user_data(stream);
     sqmp_pkt_t     *pkt     = (sqmp_pkt_t *)data;
 
+    sqmp_dbg_recv_pkt(pkt);
     switch (pkt->msg_type) {
-    case SQMP_MSG_TYPE_HELLO_ACK:
-        sqmp_process_hello_ack(stream, session, pkt);
-        break;
-    case SQMP_MSG_TYPE_AUTH_RESP:
-        sqmp_process_auth_resp(stream, session, pkt);
-        break;
-    case SQMP_MSG_TYPE_CHAT_DELIVER:
-        sqmp_process_chat_deliver(stream, session, pkt);
-        break;
-    default:
-        fprintf(stderr, "unhandled msg_type 0x%02x\n", pkt->msg_type);
-        break;
+        case SQMP_MSG_TYPE_HELLO_ACK:
+            sqmp_process_hello_ack(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_AUTH_RESP:
+            sqmp_process_auth_resp(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_KEY_RESP:
+            sqmp_process_key_resp(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_CHAT_DELIVER:
+            sqmp_process_chat_deliver(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_BYE:
+            sqmp_process_bye(stream, session, pkt);
+            break;
+        default:
+            fprintf(stderr, "unhandled msg_type 0x%02x\n", pkt->msg_type);
+            break;
     }
 }
 
@@ -57,6 +69,9 @@ static void on_disconnected(sqmp_conn_t *conn)
     (void)conn;
     printf("Disconnected from server\n");
     fflush(stdout);
+    atomic_store(&g_conn_alive, 0);
+    g_interrupted = 1;
+    pthread_kill(g_main_thread, SIGINT);
 }
 
 static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
@@ -131,19 +146,244 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
         fprintf(stderr, "failed to send AUTH_REQ\n");
         return -1;
     }
+    dbg_printf("[sent] MSG_AUTH_REQ (user='%.*s')\n", (int)ulen, username);
 
     printf("AUTH_REQ sent for '%.*s'\n", (int)ulen, username);
     fflush(stdout);
     return 0;
 }
 
+void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
+{
+    (void)pkt;
+    sqmp_send_bye(stream, session);
+    g_interrupted = 1;
+    pthread_kill(g_main_thread, SIGINT);
+}
+
+static int encrypt_chat(const uint8_t *peer_pubkey,
+                        const char *plaintext, size_t plaintext_len,
+                        uint8_t ephemeral_pub_out[32],
+                        uint8_t nonce_out[12],
+                        uint8_t *ciphertext_out,
+                        uint32_t *ciphertext_len_out)
+{
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!kctx || EVP_PKEY_keygen_init(kctx) <= 0) {
+        EVP_PKEY_CTX_free(kctx);
+        return -1;
+    }
+    EVP_PKEY *ephemeral = NULL;
+    if (EVP_PKEY_keygen(kctx, &ephemeral) <= 0) {
+        EVP_PKEY_CTX_free(kctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(kctx);
+
+    size_t klen = 32;
+    EVP_PKEY_get_raw_public_key(ephemeral, ephemeral_pub_out, &klen);
+
+    EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pubkey, 32);
+    if (!peer) {
+        EVP_PKEY_free(ephemeral);
+        return -1;
+    }
+
+    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(ephemeral, NULL);
+    EVP_PKEY_free(ephemeral);
+    if (!dctx || EVP_PKEY_derive_init(dctx) <= 0 ||
+        EVP_PKEY_derive_set_peer(dctx, peer) <= 0) {
+        EVP_PKEY_CTX_free(dctx);
+        EVP_PKEY_free(peer);
+        return -1;
+    }
+    EVP_PKEY_free(peer);
+
+    uint8_t shared[32];
+    size_t  slen = 32;
+    if (EVP_PKEY_derive(dctx, shared, &slen) <= 0) {
+        EVP_PKEY_CTX_free(dctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(dctx);
+
+    uint8_t aes_key[32];
+    SHA256(shared, 32, aes_key);
+    memset(shared, 0, 32);
+
+    if (RAND_bytes(nonce_out, 12) != 1)
+        return -1;
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int outlen = 0, final_len = 0;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)          != 1 ||
+        EVP_EncryptInit_ex(ctx, NULL, NULL, aes_key, nonce_out)                != 1 ||
+        EVP_EncryptUpdate(ctx, ciphertext_out, &outlen,
+                          (const uint8_t *)plaintext, (int)plaintext_len)      != 1 ||
+        EVP_EncryptFinal_ex(ctx, ciphertext_out + outlen, &final_len)          != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16,
+                            ciphertext_out + outlen + final_len)               != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+
+    *ciphertext_len_out = (uint32_t)(outlen + final_len + 16);
+    return 0;
+}
+
+static int decrypt_chat(const uint8_t *privkey,
+                        const uint8_t *ephemeral_pub,
+                        const uint8_t nonce[12],
+                        const uint8_t *ciphertext, uint32_t ciphertext_len,
+                        uint8_t *plaintext_out,
+                        uint32_t *plaintext_len_out)
+{
+    if (ciphertext_len < 16) return -1;
+
+    EVP_PKEY *our_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, privkey, 32);
+    if (!our_key) return -1;
+
+    EVP_PKEY *sender_pub = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, ephemeral_pub, 32);
+    if (!sender_pub) {
+        EVP_PKEY_free(our_key);
+        return -1;
+    }
+
+    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(our_key, NULL);
+    EVP_PKEY_free(our_key);
+    if (!dctx || EVP_PKEY_derive_init(dctx) <= 0 ||
+        EVP_PKEY_derive_set_peer(dctx, sender_pub) <= 0) {
+        EVP_PKEY_CTX_free(dctx);
+        EVP_PKEY_free(sender_pub);
+        return -1;
+    }
+    EVP_PKEY_free(sender_pub);
+
+    uint8_t shared[32];
+    size_t  slen = 32;
+    if (EVP_PKEY_derive(dctx, shared, &slen) <= 0) {
+        EVP_PKEY_CTX_free(dctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(dctx);
+
+    uint8_t aes_key[32];
+    SHA256(shared, 32, aes_key);
+    memset(shared, 0, 32);
+
+    uint32_t  data_len = ciphertext_len - 16;
+    void     *tag      = (void *)(uintptr_t)(ciphertext + data_len);
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int outlen = 0, final_len = 0;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)        != 1 ||
+        EVP_DecryptInit_ex(ctx, NULL, NULL, aes_key, nonce)                  != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag)             != 1 ||
+        EVP_DecryptUpdate(ctx, plaintext_out, &outlen,
+                          ciphertext, (int)data_len)                         != 1 ||
+        EVP_DecryptFinal_ex(ctx, plaintext_out + outlen, &final_len)         != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+
+    *plaintext_len_out = (uint32_t)(outlen + final_len);
+    return 0;
+}
+
+void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session,
+                               sqmp_pkt_t *pkt)
+{
+    (void)stream;
+    sqmp_msg_chat_deliver_t *msg = (sqmp_msg_chat_deliver_t *)pkt->msg;
+
+    if (session->state != SQMP_SESSION_STATE_CONN_ESTABLISHED) {
+        fprintf(stderr, "CHAT_DELIVER in unexpected state %d\n", session->state);
+        return;
+    }
+
+    printf("[from: %.*s] ciphertext: ", (int)msg->sender_len, msg->sender);
+    for (uint32_t i = 0; i < msg->ciphertext_len; i++)
+        printf("%02x", msg->ciphertext[i]);
+
+    if (msg->enc_key_len != 32 || msg->ciphertext_len < 16) {
+        printf(" text: (cannot decrypt)\n");
+        fflush(stdout);
+        return;
+    }
+
+    uint32_t plaintext_len = msg->ciphertext_len - 16;
+    uint8_t *plaintext     = malloc(plaintext_len + 1);
+    if (!plaintext) {
+        printf(" text: (alloc error)\n");
+        fflush(stdout);
+        return;
+    }
+
+    if (decrypt_chat(session->client_privkey, msg->encrypted_key, msg->nonce,
+                     msg->ciphertext, msg->ciphertext_len,
+                     plaintext, &plaintext_len) == 0) {
+        plaintext[plaintext_len] = '\0';
+        printf(" text: %.*s\n", (int)plaintext_len, (char *)plaintext);
+    } else {
+        printf(" text: (decrypt failed)\n");
+    }
+    free(plaintext);
+    fflush(stdout);
+}
+
 static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
                      const char *recipient, size_t recipient_len,
                      const char *msg, size_t msglen)
 {
-    size_t   pktlen = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_send_t) + msglen;
+    uint8_t keybuf[sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_key_req_t)];
+    memset(keybuf, 0, sizeof(keybuf));
+    sqmp_pkt_t         *kpkt = (sqmp_pkt_t *)keybuf;
+    sqmp_msg_key_req_t *kreq = (sqmp_msg_key_req_t *)kpkt->msg;
+    kpkt->version      = 1;
+    kpkt->msg_type     = SQMP_MSG_TYPE_KEY_REQ;
+    kpkt->session_id   = session->session_id;
+    kreq->username_len = (uint8_t)recipient_len;
+    memcpy(kreq->username, recipient, recipient_len);
+    sqmp_stream_send(stream, keybuf, sizeof(keybuf));
+    dbg_printf("[sent] MSG_KEY_REQ (for='%.*s')\n", (int)recipient_len, recipient);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
+    if (sem_timedwait(&session->key_fetch_sem, &ts) != 0) {
+        fprintf(stderr, "key fetch timed out for '%.*s'\n",
+                (int)recipient_len, recipient);
+        return -1;
+    }
+
+    static const uint8_t zeros[32] = {0};
+    if (memcmp(session->key_fetch_result, zeros, 32) == 0) {
+        fprintf(stderr, "user '%.*s' not found or has no key\n",
+                (int)recipient_len, recipient);
+        return -1;
+    }
+
+    uint8_t  ephemeral_pub[32];
+    uint8_t  nonce[12];
+    uint8_t *ciphertext = malloc(msglen + 16);
+    if (!ciphertext) return -1;
+    uint32_t ciphertext_len;
+
+    if (encrypt_chat(session->key_fetch_result, msg, msglen,
+                     ephemeral_pub, nonce, ciphertext, &ciphertext_len) != 0) {
+        free(ciphertext);
+        return -1;
+    }
+
+    size_t   pktlen = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_send_t) + ciphertext_len;
     uint8_t *buf    = calloc(1, pktlen);
-    if (!buf) return -1;
+    if (!buf) { free(ciphertext); return -1; }
 
     sqmp_pkt_t           *pkt  = (sqmp_pkt_t *)buf;
     sqmp_msg_chat_send_t *chat = (sqmp_msg_chat_send_t *)pkt->msg;
@@ -154,13 +394,20 @@ static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
 
     chat->recipient_len  = (uint8_t)recipient_len;
     memcpy(chat->recipient, recipient, recipient_len);
-    chat->ciphertext_len = (uint32_t)msglen;
-    memcpy(chat->ciphertext, msg, msglen);
+    chat->enc_key_len    = 32;
+    memcpy(chat->encrypted_key, ephemeral_pub, 32);
+    memcpy(chat->nonce, nonce, 12);
+    chat->ciphertext_len = ciphertext_len;
+    memcpy(chat->ciphertext, ciphertext, ciphertext_len);
 
+    free(ciphertext);
     int ret = sqmp_stream_send(stream, buf, pktlen);
+    dbg_printf("[sent] MSG_CHAT_SEND (to='%.*s' ciphertext_len=%u)\n",
+               (int)recipient_len, recipient, ciphertext_len);
     free(buf);
     return ret;
 }
+
 
 /* --------------------------------------------------------------------------
  * main
@@ -172,6 +419,7 @@ int main(void)
     session.state = SQMP_SESSION_STATE_HELLO;
     sem_init(&session.login_ready, 0, 0);
     sem_init(&session.auth_done, 0, 0);
+    sem_init(&session.key_fetch_sem, 0, 0);
 
     sigset_t sigset;
     sigemptyset(&sigset);
@@ -186,6 +434,8 @@ int main(void)
         .on_disconnected = on_disconnected,
         .on_stream_recv  = on_stream_recv,
     };
+
+    g_main_thread = pthread_self();
 
     sqmp_quic_ctx_t *ctx = sqmp_quic_init(&cfg);
     if (!ctx) return 1;
@@ -230,6 +480,7 @@ int main(void)
         msg->selected_version = 1;
         msg->max_message_size = 65535;
         sqmp_stream_send(stream, buf, sizeof(buf));
+        dbg_printf("[sent] MSG_HELLO\n");
     }
 
     while (sem_wait(&session.login_ready) == -1 && errno == EINTR && !g_interrupted)
@@ -278,12 +529,15 @@ int main(void)
         }
     }
 
-    printf("\nInterrupted, disconnecting...\n");
+    printf("\nDisconnecting...\n");
     fflush(stdout);
 
+    if (atomic_load(&g_conn_alive))
+        sqmp_send_bye(stream, &session);
     sqmp_quic_disconnect(conn);
     sqmp_quic_destroy(ctx);
     sem_destroy(&session.login_ready);
     sem_destroy(&session.auth_done);
+    sem_destroy(&session.key_fetch_sem);
     return 0;
 }

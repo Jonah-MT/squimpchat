@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <semaphore.h>
+#include "debug.h"
 
 static volatile sig_atomic_t g_stop;
 
@@ -65,13 +66,28 @@ static void send_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, int o
     resp->session_id = session->session_id;
 
     sqmp_stream_send(stream, buf, sizeof(buf));
+    dbg_printf("[sent] MSG_AUTH_RESP (user='%.*s' status=%s)\n",
+               (int)session->auth_username_len, session->auth_username,
+               ok ? "ok" : "fail");
+}
+
+void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
+{
+    (void)stream; (void)pkt;
+    if (session->state == SQMP_SESSION_STATE_CONN_ESTABLISHED) {
+        sqmp_registry_remove(session->username, session->username_len);
+        session->state = SQMP_SESSION_STATE_CLOSING;
+        printf("'%.*s' disconnected\n", (int)session->username_len, session->username);
+        fflush(stdout);
+    }
 }
 
 static void on_stream_closed(sqmp_stream_t *stream)
 {
     sqmp_session_t *session = sqmp_stream_get_user_data(stream);
-    if (session)
+    if (session) {
         atomic_store(&session->auth_stream, (sqmp_stream_t *)NULL);
+    }
 }
 
 static void on_connected(sqmp_conn_t *conn)
@@ -107,19 +123,26 @@ static void on_stream_recv(sqmp_stream_t *stream,
     sqmp_session_t *session = sqmp_stream_get_user_data(stream);
     sqmp_pkt_t     *pkt     = (sqmp_pkt_t *)data;
 
+    sqmp_dbg_recv_pkt(pkt);
     switch (pkt->msg_type) {
-    case SQMP_MSG_TYPE_HELLO:
-        sqmp_process_hello(stream, session, pkt);
-        break;
-    case SQMP_MSG_TYPE_AUTH_REQ:
-        sqmp_process_auth_req(stream, session, pkt);
-        break;
-    case SQMP_MSG_TYPE_CHAT_SEND:
-        sqmp_process_chat_send(stream, session, pkt);
-        break;
-    default:
-        fprintf(stderr, "unhandled msg_type 0x%02x\n", pkt->msg_type);
-        break;
+        case SQMP_MSG_TYPE_HELLO:
+            sqmp_process_hello(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_AUTH_REQ:
+            sqmp_process_auth_req(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_KEY_REQ:
+            sqmp_process_key_req(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_CHAT_SEND:
+            sqmp_process_chat_send(stream, session, pkt);
+            break;
+        case SQMP_MSG_TYPE_BYE:
+            sqmp_process_bye(stream, session, pkt);
+            break;
+        default:
+            fprintf(stderr, "unhandled msg_type 0x%02x\n", pkt->msg_type);
+            break;
     }
 }
 
@@ -128,7 +151,6 @@ static void on_disconnected(sqmp_conn_t *conn)
     sqmp_session_t *session = sqmp_conn_get_user_data(conn);
     if (session) {
         if (atomic_load(&session->auth_queued)) {
-            /* Session is in the auth queue; let main free it after processing */
             atomic_store(&session->conn_closed, (uint8_t)1);
             printf("Client disconnected (auth pending)\n");
             fflush(stdout);
@@ -193,8 +215,6 @@ int main(void)
         atomic_store(&pending->auth_queued, (uint8_t)0);
 
         if (atomic_load(&pending->conn_closed)) {
-            /* Client disconnected while waiting in queue; on_disconnected
-             * deferred cleanup to us since auth_queued was set at the time */
             sem_destroy(&pending->login_ready);
             free(pending);
             continue;
@@ -226,8 +246,12 @@ int main(void)
             send_auth_resp(auth_stream, pending, ok);
     }
 
-    if (g_stop)
+    if (g_stop) {
         printf("\nInterrupted, shutting down...\n");
+        fflush(stdout);
+        sqmp_registry_send_bye_all();
+        sqmp_registry_shutdown_connections();
+    }
 
     sqmp_quic_destroy(ctx);
     return 0;

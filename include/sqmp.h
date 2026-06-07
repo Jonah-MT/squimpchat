@@ -8,7 +8,6 @@
 #define SQMP_USERNAME_MAX_LEN 32
 #define SQMP_PASSWORD_HASH_LEN 32
 #define SQMP_ERROR_DESC_MAX_LEN 128
-
 typedef struct sqmp_session_s {
     uint8_t  state;
     uint32_t session_id;
@@ -29,6 +28,8 @@ typedef struct sqmp_session_s {
     uint8_t                 auth_username[SQMP_USERNAME_MAX_LEN];
     uint8_t                 auth_password_hash[SQMP_PASSWORD_HASH_LEN];
     uint8_t                 auth_pubkey[32];
+    sem_t                   key_fetch_sem;
+    uint8_t                 key_fetch_result[32];
     struct sqmp_session_s  *next;
 } sqmp_session_t;
 
@@ -163,6 +164,12 @@ void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_
 void sqmp_process_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_key_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_key_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_send_bye(sqmp_stream_t *stream, sqmp_session_t *session);
+void sqmp_registry_send_bye_all(void);
+void sqmp_registry_shutdown_connections(void);
 
 void sqmp_auth_queue_init(void);
 sqmp_session_t *sqmp_auth_queue_dequeue(void);
@@ -171,3 +178,6 @@ sqmp_session_t *sqmp_auth_queue_dequeue(void);
 int sqmp_registry_add   (const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream, const uint8_t *pubkey);
 void sqmp_registry_remove(const uint8_t *uname, uint8_t ulen);
 sqmp_stream_t *sqmp_registry_find  (const uint8_t *uname, uint8_t ulen);
+int            sqmp_registry_get_pubkey(const uint8_t *uname, uint8_t ulen, uint8_t pubkey_out[32]);
+
+void sqmp_dbg_recv_pkt(const sqmp_pkt_t *pkt);

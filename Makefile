@@ -3,6 +3,10 @@ CFLAGS   = -Wall -Wextra -I./include
 MSQUIC   = lib/libmsquic.so.2
 LDFLAGS  = $(MSQUIC) -Wl,-rpath,'$$ORIGIN/../lib' -lpthread -lcrypto
 
+ifeq ($(DEBUG),1)
+CFLAGS += -DDEBUG
+endif
+
 BIN_DIR  = bin
 CERT_DIR = certs
 CERT_KEY = $(CERT_DIR)/server.key
