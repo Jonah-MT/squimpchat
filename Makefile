@@ -1,6 +1,7 @@
-CC      = gcc
-CFLAGS  = -Wall -Wextra -I./include
-LDFLAGS = -L/usr/lib/x86_64-linux-gnu -l:libmsquic.so.2 -lpthread -lcrypto
+CC       = gcc
+CFLAGS   = -Wall -Wextra -I./include
+MSQUIC   = lib/libmsquic.so.2
+LDFLAGS  = $(MSQUIC) -Wl,-rpath,'$$ORIGIN/../lib' -lpthread -lcrypto
 
 BIN_DIR  = bin
 CERT_DIR = certs
@@ -21,11 +22,11 @@ $(CERT_CRT) $(CERT_KEY):
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-$(BIN_DIR)/server: src/server/server.c $(WRAPPER) $(SQMP) \
+$(BIN_DIR)/server: src/server/server.c $(WRAPPER) $(SQMP) $(MSQUIC) \
                    $(CERT_CRT) $(CERT_KEY) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ src/server/server.c $(WRAPPER) $(SQMP) $(LDFLAGS)
 
-$(BIN_DIR)/client: src/client/client.c $(WRAPPER) $(SQMP) | $(BIN_DIR)
+$(BIN_DIR)/client: src/client/client.c $(WRAPPER) $(SQMP) $(MSQUIC) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ src/client/client.c $(WRAPPER) $(SQMP) $(LDFLAGS)
 
 clean:
