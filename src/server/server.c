@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,13 @@ static void send_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, int o
     sqmp_stream_send(stream, buf, sizeof(buf));
 }
 
+static void on_stream_closed(sqmp_stream_t *stream)
+{
+    sqmp_session_t *session = sqmp_stream_get_user_data(stream);
+    if (session)
+        atomic_store(&session->auth_stream, (sqmp_stream_t *)NULL);
+}
+
 static void on_connected(sqmp_conn_t *conn)
 {
     sqmp_session_t *session = calloc(1, sizeof(*session));
@@ -119,6 +127,15 @@ static void on_disconnected(sqmp_conn_t *conn)
 {
     sqmp_session_t *session = sqmp_conn_get_user_data(conn);
     if (session) {
+        if (atomic_load(&session->auth_queued)) {
+            /* Session is in the auth queue; let main free it after processing */
+            atomic_store(&session->conn_closed, (uint8_t)1);
+            printf("Client disconnected (auth pending)\n");
+            fflush(stdout);
+            return;
+        }
+        if (session->state == SQMP_SESSION_STATE_CONN_ESTABLISHED)
+            sqmp_registry_remove(session->username, session->username_len);
         sem_destroy(&session->login_ready);
         free(session);
     }
@@ -146,6 +163,7 @@ int main(void)
         .on_disconnected = on_disconnected,
         .on_stream_open  = on_stream_open,
         .on_stream_recv  = on_stream_recv,
+        .on_stream_closed = on_stream_closed,
     };
 
     sqmp_quic_ctx_t *ctx = sqmp_quic_init(&cfg);
@@ -172,19 +190,39 @@ int main(void)
 
     sqmp_session_t *pending;
     while (!g_stop && (pending = sqmp_auth_queue_dequeue()) != NULL) {
+        atomic_store(&pending->auth_queued, (uint8_t)0);
+
+        if (atomic_load(&pending->conn_closed)) {
+            /* Client disconnected while waiting in queue; on_disconnected
+             * deferred cleanup to us since auth_queued was set at the time */
+            sem_destroy(&pending->login_ready);
+            free(pending);
+            continue;
+        }
+
         char username[SQMP_USERNAME_MAX_LEN + 1] = {0};
         memcpy(username, pending->auth_username, pending->auth_username_len);
 
         int ok = verify_credentials(username, pending->auth_password_hash);
-        send_auth_resp(pending->auth_stream, pending, ok);
-
         if (ok) {
-            pending->state = SQMP_SESSION_STATE_CONN_ESTABLISHED;
-            printf("Auth OK for '%s'\n", username);
+            if (sqmp_registry_add(pending->auth_username, pending->auth_username_len,
+                                  atomic_load(&pending->auth_stream)) == 0) {
+                pending->username_len = pending->auth_username_len;
+                memcpy(pending->username, pending->auth_username, pending->auth_username_len);
+                pending->state = SQMP_SESSION_STATE_CONN_ESTABLISHED;
+                printf("Auth OK for '%s'\n", username);
+            } else {
+                ok = 0;
+                printf("Auth FAILED for '%s' (already logged in)\n", username);
+            }
         } else {
             printf("Auth FAILED for '%s'\n", username);
         }
         fflush(stdout);
+
+        sqmp_stream_t *auth_stream = atomic_load(&pending->auth_stream);
+        if (auth_stream)
+            send_auth_resp(auth_stream, pending, ok);
     }
 
     if (g_stop)

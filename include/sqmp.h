@@ -2,6 +2,7 @@
 
 #include "msquic_wrapper.h"
 #include <semaphore.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #define SQMP_USERNAME_MAX_LEN 32
@@ -15,14 +16,17 @@ typedef struct sqmp_session_s {
     uint8_t  username[SQMP_USERNAME_MAX_LEN];
     sem_t    login_ready;
 
-    sem_t    auth_done;  /* posted by sqmp_process_auth_resp; client main blocks on this */
-    uint8_t  auth_ok;   /* set by sqmp_process_auth_resp before posting auth_done */
+    sem_t    auth_done;
+    uint8_t  auth_ok;
 
-    struct sqmp_stream_s   *auth_stream;
+    _Atomic(struct sqmp_stream_s *) auth_stream;
+    _Atomic uint8_t                 auth_queued;
+    _Atomic uint8_t                 conn_closed;
+
     uint8_t                 auth_username_len;
     uint8_t                 auth_username[SQMP_USERNAME_MAX_LEN];
     uint8_t                 auth_password_hash[SQMP_PASSWORD_HASH_LEN];
-    struct sqmp_session_s  *next; /* auth queue linkage */
+    struct sqmp_session_s  *next;
 } sqmp_session_t;
 
 enum sqmp_session_state_e {
@@ -158,4 +162,9 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, s
 void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 
 void sqmp_auth_queue_init(void);
-sqmp_session_t *sqmp_auth_queue_dequeue (void);
+sqmp_session_t *sqmp_auth_queue_dequeue(void);
+
+#define SQMP_REGISTRY_MAX 64
+int            sqmp_registry_add   (const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream);
+void           sqmp_registry_remove(const uint8_t *uname, uint8_t ulen);
+sqmp_stream_t *sqmp_registry_find  (const uint8_t *uname, uint8_t ulen);

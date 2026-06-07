@@ -119,6 +119,7 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
 }
 
 static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
+                     const char *recipient, size_t recipient_len,
                      const char *msg, size_t msglen)
 {
     size_t   pktlen = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_send_t) + msglen;
@@ -132,8 +133,8 @@ static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
     pkt->msg_type   = SQMP_MSG_TYPE_CHAT_SEND;
     pkt->session_id = session->session_id;
 
-    chat->recipient_len  = session->username_len;
-    memcpy(chat->recipient, session->username, session->username_len);
+    chat->recipient_len  = (uint8_t)recipient_len;
+    memcpy(chat->recipient, recipient, recipient_len);
     chat->ciphertext_len = (uint32_t)msglen;
     memcpy(chat->ciphertext, msg, msglen);
 
@@ -225,6 +226,9 @@ int main(void)
         printf("Logged in. Type messages and press Enter to send:\n");
         fflush(stdout);
 
+        printf("Usage: <username> <message>\n");
+        fflush(stdout);
+
         char line[1024];
         while (!g_interrupted) {
             if (!fgets(line, sizeof(line), stdin)) break;
@@ -234,7 +238,23 @@ int main(void)
             if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
             if (len == 0) continue;
 
-            if (send_chat(stream, &session, line, len) != 0)
+            char *space = strchr(line, ' ');
+            if (!space || space == line || *(space + 1) == '\0') {
+                printf("Usage: <username> <message>\n");
+                fflush(stdout);
+                continue;
+            }
+
+            size_t      recipient_len = (size_t)(space - line);
+            const char *msg           = space + 1;
+            size_t      msglen        = len - recipient_len - 1;
+
+            if (recipient_len > SQMP_USERNAME_MAX_LEN) {
+                fprintf(stderr, "recipient name too long\n");
+                continue;
+            }
+
+            if (send_chat(stream, &session, line, recipient_len, msg, msglen) != 0)
                 fprintf(stderr, "failed to send message\n");
         }
     }

@@ -22,7 +22,7 @@ void sqmp_auth_queue_init(void)
 sqmp_session_t *sqmp_auth_queue_dequeue(void)
 {
     if (sem_wait(&g_auth_queue_sem) != 0)
-        return NULL;  /* EINTR */
+        return NULL;
 
     pthread_mutex_lock(&g_auth_queue_mutex);
     sqmp_session_t *s = g_auth_queue_head;
@@ -48,6 +48,73 @@ static void auth_queue_enqueue(sqmp_session_t *session)
     }
     pthread_mutex_unlock(&g_auth_queue_mutex);
     sem_post(&g_auth_queue_sem);
+}
+
+typedef struct {
+    uint8_t        in_use;
+    uint8_t        username_len;
+    uint8_t        username[SQMP_USERNAME_MAX_LEN];
+    sqmp_stream_t *stream;
+} sqmp_registry_entry_t;
+
+static pthread_mutex_t       g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static sqmp_registry_entry_t g_registry[SQMP_REGISTRY_MAX];
+
+int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream)
+{
+    int slot = -1;
+    pthread_mutex_lock(&g_registry_mutex);
+    for (int i = 0; i < SQMP_REGISTRY_MAX; i++) {
+        if (!g_registry[i].in_use) {
+            if (slot < 0) slot = i;
+            continue;
+        }
+        if (g_registry[i].username_len == ulen &&
+            memcmp(g_registry[i].username, uname, ulen) == 0) {
+            pthread_mutex_unlock(&g_registry_mutex);
+            return -1;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_registry_mutex);
+        return -1;
+    }
+    g_registry[slot].in_use       = 1;
+    g_registry[slot].username_len = ulen;
+    memcpy(g_registry[slot].username, uname, ulen);
+    g_registry[slot].stream       = stream;
+    pthread_mutex_unlock(&g_registry_mutex);
+    return 0;
+}
+
+void sqmp_registry_remove(const uint8_t *uname, uint8_t ulen)
+{
+    pthread_mutex_lock(&g_registry_mutex);
+    for (int i = 0; i < SQMP_REGISTRY_MAX; i++) {
+        if (g_registry[i].in_use &&
+            g_registry[i].username_len == ulen &&
+            memcmp(g_registry[i].username, uname, ulen) == 0) {
+            memset(&g_registry[i], 0, sizeof(g_registry[i]));
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_registry_mutex);
+}
+
+sqmp_stream_t *sqmp_registry_find(const uint8_t *uname, uint8_t ulen)
+{
+    sqmp_stream_t *stream = NULL;
+    pthread_mutex_lock(&g_registry_mutex);
+    for (int i = 0; i < SQMP_REGISTRY_MAX; i++) {
+        if (g_registry[i].in_use &&
+            g_registry[i].username_len == ulen &&
+            memcmp(g_registry[i].username, uname, ulen) == 0) {
+            stream = g_registry[i].stream;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_registry_mutex);
+    return stream;
 }
 
 void sqmp_process_hello(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
@@ -90,11 +157,11 @@ void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_
     }
     sqmp_msg_auth_req_t *auth = (sqmp_msg_auth_req_t *)pkt->msg;
 
-    session->auth_stream       = stream;
     session->auth_username_len = auth->username_len;
     memcpy(session->auth_username,      auth->username,      auth->username_len);
     memcpy(session->auth_password_hash, auth->password_hash, SQMP_PASSWORD_HASH_LEN);
-
+    atomic_store(&session->auth_stream, stream);
+    atomic_store(&session->auth_queued, (uint8_t)1);
     auth_queue_enqueue(session);
 }
 
@@ -138,26 +205,35 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, s
     fflush(stdout);
 }
 
-void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt) {
+void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
+{
+    (void)stream;
     sqmp_msg_chat_send_t *msg = (sqmp_msg_chat_send_t *)pkt->msg;
-    sqmp_pkt_t *deliver_pkt = (sqmp_pkt_t *)malloc(sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_deliver_t) + msg->ciphertext_len);
-    sqmp_msg_chat_deliver_t *echo = (sqmp_msg_chat_deliver_t *)deliver_pkt->msg;
 
-    if (session->state == SQMP_SESSION_STATE_CONN_ESTABLISHED) {
-        deliver_pkt->session_id = pkt->session_id;
-        deliver_pkt->msg_type = SQMP_MSG_TYPE_CHAT_DELIVER;
-
-        echo->ciphertext_len = msg->ciphertext_len;
-        memcpy(echo->ciphertext, msg->ciphertext, msg->ciphertext_len);
-
-        echo->sender_len = msg->recipient_len;
-        memcpy(echo->sender, msg->recipient, msg->recipient_len);
-
-        sqmp_stream_send(stream, (uint8_t *)deliver_pkt, sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_deliver_t) + msg->ciphertext_len);
-
-    } else {
+    if (session->state != SQMP_SESSION_STATE_CONN_ESTABLISHED) {
         fprintf(stderr, "CHAT_SEND in unexpected state %d\n", session->state);
+        return;
     }
 
-    free(deliver_pkt);
+    sqmp_stream_t *dst = sqmp_registry_find(msg->recipient, msg->recipient_len);
+    if (!dst) return;
+
+    size_t      pktlen = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_deliver_t) + msg->ciphertext_len;
+    sqmp_pkt_t *out    = malloc(pktlen);
+    if (!out) return;
+    memset(out, 0, pktlen);
+
+    sqmp_msg_chat_deliver_t *deliver = (sqmp_msg_chat_deliver_t *)out->msg;
+
+    out->version    = 1;
+    out->msg_type   = SQMP_MSG_TYPE_CHAT_DELIVER;
+    out->session_id = pkt->session_id;
+
+    deliver->sender_len  = session->username_len;
+    memcpy(deliver->sender, session->username, session->username_len);
+    deliver->ciphertext_len = msg->ciphertext_len;
+    memcpy(deliver->ciphertext, msg->ciphertext, msg->ciphertext_len);
+
+    sqmp_stream_send(dst, (uint8_t *)out, pktlen);
+    free(out);
 }
