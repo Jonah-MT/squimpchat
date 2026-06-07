@@ -1,6 +1,7 @@
 #include "client.h"
 #include "sqmp.h"
 #include <errno.h>
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <pthread.h>
 #include <signal.h>
@@ -91,7 +92,24 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     SHA256((const unsigned char *)password, pwlen, pw_hash);
     memset(password, 0, sizeof(password));
 
-    uint8_t buf[sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_auth_req_t)];
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!kctx || EVP_PKEY_keygen_init(kctx) <= 0) {
+        EVP_PKEY_CTX_free(kctx);
+        return -1;
+    }
+    EVP_PKEY *pkey = NULL;
+    if (EVP_PKEY_keygen(kctx, &pkey) <= 0) {
+        EVP_PKEY_CTX_free(kctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(kctx);
+    size_t klen = 32;
+    EVP_PKEY_get_raw_public_key(pkey, session->client_pubkey, &klen);
+    klen = 32;
+    EVP_PKEY_get_raw_private_key(pkey, session->client_privkey, &klen);
+    EVP_PKEY_free(pkey);
+
+    uint8_t buf[sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_auth_req_t) + 32];
     memset(buf, 0, sizeof(buf));
     sqmp_pkt_t          *pkt  = (sqmp_pkt_t *)buf;
     sqmp_msg_auth_req_t *auth = (sqmp_msg_auth_req_t *)pkt->msg;
@@ -103,7 +121,8 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     auth->username_len = (uint8_t)ulen;
     memcpy(auth->username,      username, ulen);
     memcpy(auth->password_hash, pw_hash,  SQMP_PASSWORD_HASH_LEN);
-    auth->pubkey_len = 0;
+    auth->pubkey_len = 32;
+    memcpy(auth->public_key, session->client_pubkey, 32);
 
     session->username_len = (uint8_t)ulen;
     memcpy(session->username, username, ulen);

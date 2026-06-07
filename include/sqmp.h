@@ -18,6 +18,8 @@ typedef struct sqmp_session_s {
 
     sem_t    auth_done;
     uint8_t  auth_ok;
+    uint8_t  client_pubkey[32];
+    uint8_t  client_privkey[32];
 
     _Atomic(struct sqmp_stream_s *) auth_stream;
     _Atomic uint8_t                 auth_queued;
@@ -26,6 +28,7 @@ typedef struct sqmp_session_s {
     uint8_t                 auth_username_len;
     uint8_t                 auth_username[SQMP_USERNAME_MAX_LEN];
     uint8_t                 auth_password_hash[SQMP_PASSWORD_HASH_LEN];
+    uint8_t                 auth_pubkey[32];
     struct sqmp_session_s  *next;
 } sqmp_session_t;
 
@@ -165,6 +168,6 @@ void sqmp_auth_queue_init(void);
 sqmp_session_t *sqmp_auth_queue_dequeue(void);
 
 #define SQMP_REGISTRY_MAX 64
-int            sqmp_registry_add   (const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream);
-void           sqmp_registry_remove(const uint8_t *uname, uint8_t ulen);
+int sqmp_registry_add   (const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream, const uint8_t *pubkey);
+void sqmp_registry_remove(const uint8_t *uname, uint8_t ulen);
 sqmp_stream_t *sqmp_registry_find  (const uint8_t *uname, uint8_t ulen);

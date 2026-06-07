@@ -54,13 +54,14 @@ typedef struct {
     uint8_t        in_use;
     uint8_t        username_len;
     uint8_t        username[SQMP_USERNAME_MAX_LEN];
+    uint8_t        public_key[32];
     sqmp_stream_t *stream;
 } sqmp_registry_entry_t;
 
 static pthread_mutex_t       g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sqmp_registry_entry_t g_registry[SQMP_REGISTRY_MAX];
 
-int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream)
+int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream, const uint8_t *pubkey)
 {
     int slot = -1;
     pthread_mutex_lock(&g_registry_mutex);
@@ -83,6 +84,7 @@ int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream)
     g_registry[slot].username_len = ulen;
     memcpy(g_registry[slot].username, uname, ulen);
     g_registry[slot].stream       = stream;
+    memcpy(g_registry[slot].public_key, pubkey, 32);
     pthread_mutex_unlock(&g_registry_mutex);
     return 0;
 }
@@ -160,6 +162,8 @@ void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_
     session->auth_username_len = auth->username_len;
     memcpy(session->auth_username,      auth->username,      auth->username_len);
     memcpy(session->auth_password_hash, auth->password_hash, SQMP_PASSWORD_HASH_LEN);
+    if (auth->pubkey_len == 32)
+        memcpy(session->auth_pubkey, auth->public_key, 32);
     atomic_store(&session->auth_stream, stream);
     atomic_store(&session->auth_queued, (uint8_t)1);
     auth_queue_enqueue(session);

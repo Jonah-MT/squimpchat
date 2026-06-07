@@ -206,7 +206,8 @@ int main(void)
         int ok = verify_credentials(username, pending->auth_password_hash);
         if (ok) {
             if (sqmp_registry_add(pending->auth_username, pending->auth_username_len,
-                                  atomic_load(&pending->auth_stream)) == 0) {
+                                  atomic_load(&pending->auth_stream),
+                                  pending->auth_pubkey) == 0) {
                 pending->username_len = pending->auth_username_len;
                 memcpy(pending->username, pending->auth_username, pending->auth_username_len);
                 pending->state = SQMP_SESSION_STATE_CONN_ESTABLISHED;
