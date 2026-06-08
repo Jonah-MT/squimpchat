@@ -74,7 +74,7 @@ The server listens on port **4433** and reads users from `data/users.txt`.
 ### Client
 
 ```sh
-./bin/client <server ip>
+./bin/client <server ip/hostname>
 ```
 
 After connecting, you'll be prompted for a username and password. Typing is echo-suppressed for the password.
