@@ -20,12 +20,25 @@ static pthread_t             g_main_thread;
 static _Atomic int           g_conn_alive = 1;
 static _Atomic int           g_readline_active = 0;
 
+/*
+ * sig_handler
+ * Sets the interrupted flag on SIGINT/SIGTERM.
+ *
+ * in:  sig - signal number (unused)
+ */
 static void sig_handler(int sig)
 {
     (void)sig;
     g_interrupted = 1;
 }
 
+/*
+ * rl_interrupt_hook
+ * readline event hook called every 100ms. Forces readline to return
+ * immediately when the interrupted flag is set.
+ *
+ * out: 0 (always)
+ */
 static int rl_interrupt_hook(void)
 {
     if (g_interrupted) {
@@ -35,6 +48,12 @@ static int rl_interrupt_hook(void)
     return 0;
 }
 
+/*
+ * on_connected
+ * Prints message when the QUIC connection is established.
+ *
+ * in:  conn - the new connection (unused)
+ */
 static void on_connected(sqmp_conn_t *conn)
 {
     (void)conn;
@@ -42,6 +61,14 @@ static void on_connected(sqmp_conn_t *conn)
     fflush(stdout);
 }
 
+/*
+ * on_stream_recv
+ * Sends an incoming packet to the appropriate handler.
+ *
+ * in:  stream - stream the data arrived on
+ *      data   - raw packet bytes
+ *      len    - number of bytes
+ */
 static void on_stream_recv(sqmp_stream_t *stream,
                             const uint8_t *data, size_t len)
 {
@@ -75,6 +102,13 @@ static void on_stream_recv(sqmp_stream_t *stream,
     }
 }
 
+/*
+ * on_disconnected
+ * Called when the server terminates the connection. Wakes the main
+ * thread so it can exit cleanly.
+ *
+ * in:  conn - the connection that dropped (unused)
+ */
 static void on_disconnected(sqmp_conn_t *conn)
 {
     (void)conn;
@@ -88,6 +122,15 @@ static void on_disconnected(sqmp_conn_t *conn)
     pthread_kill(g_main_thread, SIGINT);
 }
 
+/*
+ * sqmp_login
+ * Prompts for username and password, generates an X25519 keypair, and
+ * sends AUTH_REQ to the server.
+ *
+ * in:  stream  - stream to send on
+ *      session - session to populate with login info
+ * out: 0 on success, -1 on failure
+ */
 static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
 {
     char username[SQMP_USERNAME_MAX_LEN + 1] = {0};
@@ -109,7 +152,7 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     tcgetattr(STDIN_FILENO, &old_t);
     new_t         = old_t;
     new_t.c_lflag &= ~(tcflag_t)ECHO;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_t);
+    tcsetattr(STDIN_FILENO, TCSAFnowLUSH, &new_t);
     char *rd = fgets(password, sizeof(password), stdin);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_t);
     printf("\n");
@@ -166,6 +209,13 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     return 0;
 }
 
+/*
+ * sqmp_process_bye
+ * Handler for MSG_BYE. Echoes a BYE back and wakes the main thread
+ * to begin shutdown.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)pkt;
@@ -174,6 +224,22 @@ void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t
     pthread_kill(g_main_thread, SIGINT);
 }
 
+/*
+ * encrypt_chat
+ * Encrypts plaintext using X25519 ECDH + AES-256-GCM and recipient's
+ * public key. Generates an ephemeral keypair per message; the public
+ * key is written to ephemeral_pub_out so the recipient can derive the
+ * same AES key.
+ *
+ * in:  peer_pubkey        - recipient's 32-byte X25519 public key
+ *      plaintext          - message to encrypt
+ *      plaintext_len      - length of plaintext
+ *      ephemeral_pub_out  - receives the ephemeral public key (32 bytes)
+ *      nonce_out          - receives the random nonce (12 bytes)
+ *      ciphertext_out     - buffer for output (caller allocates msglen+16)
+ *      ciphertext_len_out - receives the final ciphertext length
+ * out: 0 on success, -1 on failure
+ */
 static int encrypt_chat(const uint8_t *peer_pubkey,
                         const char *plaintext, size_t plaintext_len,
                         uint8_t ephemeral_pub_out[32],
@@ -247,6 +313,20 @@ static int encrypt_chat(const uint8_t *peer_pubkey,
     return 0;
 }
 
+/*
+ * decrypt_chat
+ * Decrypts a received AES-256-GCM ciphertext using our private key and
+ * the sender's ephemeral public key.
+ *
+ * in:  privkey           - our 32-byte X25519 private key
+ *      ephemeral_pub     - sender's ephemeral public key (32 bytes)
+ *      nonce             - 12-byte nonce
+ *      ciphertext        - ciphertext with 16-byte auth tag appended
+ *      ciphertext_len    - total length including tag
+ *      plaintext_out     - buffer for decrypted output
+ *      plaintext_len_out - receives the plaintext length
+ * out: 0 on success, -1 on failure (including auth tag mismatch)
+ */
 static int decrypt_chat(const uint8_t *privkey,
                         const uint8_t *ephemeral_pub,
                         const uint8_t nonce[12],
@@ -309,6 +389,13 @@ static int decrypt_chat(const uint8_t *privkey,
     return 0;
 }
 
+/*
+ * sqmp_process_chat_deliver
+ * Handler for MSG_CHAT_DELIVER. Decrypts and prints the incoming
+ * message without disrupting whatever the user is typing.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session,
                                sqmp_pkt_t *pkt)
 {
@@ -354,6 +441,20 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session,
     if (rl_active) rl_forced_update_display();
 }
 
+/*
+ * send_chat
+ * Fetches the recipient's public key from the server, encrypts the
+ * message, and sends it as MSG_CHAT_SEND. Blocks up to 5 seconds
+ * waiting for the key response.
+ *
+ * in:  stream        - stream to send on
+ *      session       - current session
+ *      recipient     - recipient username
+ *      recipient_len - length of recipient username
+ *      msg           - message text
+ *      msglen        - length of message
+ * out: 0 on success, -1 on failure
+ */
 static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
                      const char *recipient, size_t recipient_len,
                      const char *msg, size_t msglen)

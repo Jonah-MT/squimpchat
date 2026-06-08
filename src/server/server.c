@@ -12,8 +12,22 @@
 
 static volatile sig_atomic_t g_stop;
 
+/*
+ * sig_handler
+ * Sets the stop flag on SIGINT/SIGTERM.
+ *
+ * in:  sig - signal number (unused)
+ */
 static void sig_handler(int sig) { (void)sig; g_stop = 1; }
 
+/*
+ * verify_credentials
+ * Checks a username and password hash against users.txt.
+ *
+ * in:  username      - null-terminated username string
+ *      password_hash - SHA-256 hash of the password (32 bytes)
+ * out: 1 if credentials match, 0 otherwise
+ */
 static int verify_credentials(const char *username, const uint8_t *password_hash)
 {
     FILE *f = fopen(USERS_FILE, "r");
@@ -51,6 +65,14 @@ static int verify_credentials(const char *username, const uint8_t *password_hash
     return result;
 }
 
+/*
+ * send_auth_resp
+ * Sends an AUTH_RESP packet with OK or INVALID status.
+ *
+ * in:  stream  - stream to send on
+ *      session - session (used for session_id and username)
+ *      ok      - 1 for success, 0 for failure
+ */
 static void send_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, int ok)
 {
     uint8_t buf[sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_auth_resp_t)];
@@ -71,6 +93,13 @@ static void send_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, int o
                ok ? "ok" : "fail");
 }
 
+/*
+ * sqmp_process_bye
+ * Handler for MSG_BYE. Removes the user from the registry
+ * and prints a disconnect notice.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)stream; (void)pkt;
@@ -82,6 +111,12 @@ void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t
     }
 }
 
+/*
+ * on_stream_closed
+ * Clears the session's auth_stream pointer when a stream closes.
+ *
+ * in:  stream - the stream that closed
+ */
 static void on_stream_closed(sqmp_stream_t *stream)
 {
     sqmp_session_t *session = sqmp_stream_get_user_data(stream);
@@ -90,6 +125,12 @@ static void on_stream_closed(sqmp_stream_t *stream)
     }
 }
 
+/*
+ * on_connected
+ * Allocates a fresh session for a newly connected client.
+ *
+ * in:  conn - the new connection
+ */
 static void on_connected(sqmp_conn_t *conn)
 {
     sqmp_session_t *session = calloc(1, sizeof(*session));
@@ -105,6 +146,13 @@ static void on_connected(sqmp_conn_t *conn)
     fflush(stdout);
 }
 
+/*
+ * on_stream_open
+ * Attaches the connection's session to a newly opened stream.
+ *
+ * in:  conn   - the connection
+ *      stream - the newly opened stream
+ */
 static void on_stream_open(sqmp_conn_t *conn, sqmp_stream_t *stream)
 {
     sqmp_stream_set_user_data(stream, sqmp_conn_get_user_data(conn));
@@ -113,6 +161,14 @@ static void on_stream_open(sqmp_conn_t *conn, sqmp_stream_t *stream)
     fflush(stdout);
 }
 
+/*
+ * on_stream_recv
+ * Dispatches an incoming packet to the appropriate handler function.
+ *
+ * in:  stream - stream the data arrived on
+ *      data   - raw packet bytes
+ *      len    - number of bytes
+ */
 static void on_stream_recv(sqmp_stream_t *stream,
                             const uint8_t *data, size_t len)
 {
@@ -146,6 +202,12 @@ static void on_stream_recv(sqmp_stream_t *stream,
     }
 }
 
+/*
+ * on_disconnected
+ * Session cleanup when a client disconnects
+ *
+ * in:  conn - the connection that dropped
+ */
 static void on_disconnected(sqmp_conn_t *conn)
 {
     sqmp_session_t *session = sqmp_conn_get_user_data(conn);

@@ -6,6 +6,16 @@
 
 #define DEFAULT_USERS_FILE "users.txt"
 
+/*
+ * main
+ * Adds a user to the users file. Checks for duplicates, then appends
+ * "username:sha256hex" to the file.
+ *
+ * in:  argv[1] - username
+ *      argv[2] - password
+ *      argv[3] - path to users file (optional, default: "users.txt")
+ * out: 0 on success, 1 on error
+ */
 int main(int argc, char *argv[])
 {
     if (argc < 3 || argc > 4) {

@@ -15,11 +15,22 @@ static sem_t           g_auth_queue_sem;
 static sqmp_session_t *g_auth_queue_head  = NULL;
 static sqmp_session_t *g_auth_queue_tail  = NULL;
 
+/*
+ * sqmp_auth_queue_init
+ * Initializes the auth queue semaphore. Call once before starting the server.
+ */
 void sqmp_auth_queue_init(void)
 {
     sem_init(&g_auth_queue_sem, 0, 0);
 }
 
+/*
+ * sqmp_auth_queue_dequeue
+ * Blocks until a session is ready to authenticate, then removes and
+ * returns it from the queue.
+ *
+ * out: next session to authenticate, or NULL if interrupted
+ */
 sqmp_session_t *sqmp_auth_queue_dequeue(void)
 {
     if (sem_wait(&g_auth_queue_sem) != 0)
@@ -37,6 +48,12 @@ sqmp_session_t *sqmp_auth_queue_dequeue(void)
     return s;
 }
 
+/*
+ * auth_queue_enqueue
+ * Appends a session to the auth queue and wakes whoever is waiting on it.
+ *
+ * in:  session - the session to enqueue
+ */
 static void auth_queue_enqueue(sqmp_session_t *session)
 {
     session->next = NULL;
@@ -51,6 +68,7 @@ static void auth_queue_enqueue(sqmp_session_t *session)
     sem_post(&g_auth_queue_sem);
 }
 
+// The registry is an array of registry entries that the server uses to store information about each active connection
 typedef struct {
     uint8_t        in_use;
     uint8_t        username_len;
@@ -62,6 +80,16 @@ typedef struct {
 static pthread_mutex_t       g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sqmp_registry_entry_t g_registry[SQMP_REGISTRY_MAX];
 
+/*
+ * sqmp_registry_add
+ * Adds a logged-in user to the connected-user registry.
+ *
+ * in:  uname  - username bytes
+ *      ulen   - username length
+ *      stream - the user's stream
+ *      pubkey - user's 32-byte X25519 public key
+ * out: 0 on success, -1 if already registered or registry is full
+ */
 int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream, const uint8_t *pubkey)
 {
     int slot = -1;
@@ -90,6 +118,13 @@ int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream,
     return 0;
 }
 
+/*
+ * sqmp_registry_remove
+ * Removes a user from the registry by username. No-op if not found.
+ *
+ * in:  uname - username bytes
+ *      ulen  - username length
+ */
 void sqmp_registry_remove(const uint8_t *uname, uint8_t ulen)
 {
     pthread_mutex_lock(&g_registry_mutex);
@@ -104,6 +139,14 @@ void sqmp_registry_remove(const uint8_t *uname, uint8_t ulen)
     pthread_mutex_unlock(&g_registry_mutex);
 }
 
+/*
+ * sqmp_registry_find
+ * Looks up a registered user's stream by username.
+ *
+ * in:  uname - username bytes
+ *      ulen  - username length
+ * out: the user's stream, or NULL if not found
+ */
 sqmp_stream_t *sqmp_registry_find(const uint8_t *uname, uint8_t ulen)
 {
     sqmp_stream_t *stream = NULL;
@@ -120,6 +163,15 @@ sqmp_stream_t *sqmp_registry_find(const uint8_t *uname, uint8_t ulen)
     return stream;
 }
 
+/*
+ * sqmp_registry_get_pubkey
+ * Copies the public key for a registered user into pubkey_out.
+ *
+ * in:  uname      - username bytes
+ *      ulen       - username length
+ *      pubkey_out - 32-byte buffer to write into
+ * out: 0 on success, -1 if not found
+ */
 int sqmp_registry_get_pubkey(const uint8_t *uname, uint8_t ulen, uint8_t pubkey_out[32])
 {
     int found = -1;
@@ -137,6 +189,13 @@ int sqmp_registry_get_pubkey(const uint8_t *uname, uint8_t ulen, uint8_t pubkey_
     return found;
 }
 
+/*
+ * sqmp_send_bye
+ * Sends a BYE packet on the given stream to signal a clean disconnect.
+ *
+ * in:  stream  - stream to send on
+ *      session - session (used for session_id)
+ */
 void sqmp_send_bye(sqmp_stream_t *stream, sqmp_session_t *session)
 {
     sqmp_pkt_t pkt    = {0};
@@ -147,12 +206,22 @@ void sqmp_send_bye(sqmp_stream_t *stream, sqmp_session_t *session)
     dbg_printf("[sent] MSG_BYE (session=%u)\n", session ? session->session_id : 0);
 }
 
+/*
+ * sqmp_process_bye (weak)
+ * Default no-op handler for MSG_BYE. Overridden by server.c and client.c.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 __attribute__((weak))
 void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)stream; (void)session; (void)pkt;
 }
 
+/*
+ * sqmp_registry_send_bye_all
+ * Sends a BYE packet to every user in the registry. Used on server shutdown.
+ */
 void sqmp_registry_send_bye_all(void)
 {
     pthread_mutex_lock(&g_registry_mutex);
@@ -167,6 +236,10 @@ void sqmp_registry_send_bye_all(void)
     pthread_mutex_unlock(&g_registry_mutex);
 }
 
+/*
+ * sqmp_registry_shutdown_connections
+ * Tells MsQuic to shut down every registered connection.
+ */
 void sqmp_registry_shutdown_connections(void)
 {
     pthread_mutex_lock(&g_registry_mutex);
@@ -180,6 +253,13 @@ void sqmp_registry_shutdown_connections(void)
     pthread_mutex_unlock(&g_registry_mutex);
 }
 
+/*
+ * sqmp_process_hello
+ * Server-side handler for MSG_HELLO. Checks that the client supports
+ * version 1, assigns a session ID, and sends HELLO_ACK.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_hello(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     if (session->state != SQMP_SESSION_STATE_HELLO) {
@@ -215,6 +295,13 @@ void sqmp_process_hello(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt
     session->state = SQMP_SESSION_STATE_AUTH;
 }
 
+/*
+ * sqmp_process_hello_ack
+ * Client-side handler for MSG_HELLO_ACK. Stores the session ID and
+ * signals the login thread to proceed.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_hello_ack(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)stream;
@@ -232,6 +319,13 @@ void sqmp_process_hello_ack(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
     sem_post(&session->login_ready);
 }
 
+/*
+ * sqmp_process_auth_req
+ * Server-side handler for MSG_AUTH_REQ. Copies credentials into the
+ * session and queues it for the auth worker thread.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     if (session->state != SQMP_SESSION_STATE_AUTH) {
@@ -250,6 +344,13 @@ void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_
     auth_queue_enqueue(session);
 }
 
+/*
+ * sqmp_process_auth_resp
+ * Client-side handler for MSG_AUTH_RESP. Updates session state based on
+ * whether auth succeeded, then signals the waiting login thread.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)stream;
@@ -271,6 +372,12 @@ void sqmp_process_auth_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
 }
 
 
+/*
+ * sqmp_process_chat_deliver (weak)
+ * Default no-op handler for MSG_CHAT_DELIVER. Overridden by client.c.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 __attribute__((weak))
 void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
@@ -279,6 +386,13 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, s
     (void)pkt;
 }
 
+/*
+ * sqmp_process_chat_send
+ * Server-side handler for MSG_CHAT_SEND. Looks up the recipient in the
+ * registry and forwards the message as MSG_CHAT_DELIVER.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)stream;
@@ -320,6 +434,13 @@ void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
 }
 
 
+/*
+ * sqmp_process_key_req
+ * Server-side handler for MSG_KEY_REQ. Looks up the requested user's
+ * public key in the registry and sends it back as MSG_KEY_RESP.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_key_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     if (session->state != SQMP_SESSION_STATE_CONN_ESTABLISHED) {
@@ -354,6 +475,13 @@ void sqmp_process_key_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_p
     free(buf);
 }
 
+/*
+ * sqmp_process_key_resp
+ * Client-side handler for MSG_KEY_RESP. Stores the returned public key
+ * and signals the send_chat call that was waiting on it.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
 void sqmp_process_key_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
     (void)stream;
@@ -365,6 +493,12 @@ void sqmp_process_key_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_
     sem_post(&session->key_fetch_sem);
 }
 
+/*
+ * sqmp_dbg_recv_pkt
+ * Prints info about a received packet. No-op in non-debug builds.
+ *
+ * in:  pkt - the received packet
+ */
 void sqmp_dbg_recv_pkt(const sqmp_pkt_t *pkt)
 {
 #ifdef DEBUG

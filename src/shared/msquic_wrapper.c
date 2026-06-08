@@ -12,6 +12,16 @@ typedef struct {
     uint8_t     data[];
 } send_buf_t;
 
+/*
+ * stream_cb
+ * MsQuic callback for stream events. Handles received data, send
+ * completions, and stream shutdown. Frees the stream struct on shutdown.
+ *
+ * in:  handle  - MsQuic stream handle
+ *      ctx_ptr - our sqmp_stream_t
+ *      ev      - stream event
+ * out: QUIC_STATUS_SUCCESS
+ */
 static QUIC_STATUS QUIC_API
 stream_cb(HQUIC handle, void *ctx_ptr, QUIC_STREAM_EVENT *ev)
 {
@@ -66,6 +76,16 @@ stream_cb(HQUIC handle, void *ctx_ptr, QUIC_STREAM_EVENT *ev)
     return QUIC_STATUS_SUCCESS;
 }
 
+/*
+ * conn_cb
+ * MsQuic callback for connection events. Called on connect, disconnect,
+ * and when a new stream opens.
+ *
+ * in:  handle  - MsQuic connection handle (unused)
+ *      ctx_ptr - our sqmp_conn_t
+ *      ev      - connection event
+ * out: QUIC_STATUS_SUCCESS
+ */
 static QUIC_STATUS QUIC_API
 conn_cb(HQUIC handle, void *ctx_ptr, QUIC_CONNECTION_EVENT *ev)
 {
@@ -127,6 +147,16 @@ conn_cb(HQUIC handle, void *ctx_ptr, QUIC_CONNECTION_EVENT *ev)
     return QUIC_STATUS_SUCCESS;
 }
 
+/*
+ * listener_cb
+ * MsQuic callback for new incoming connections. Allocates a sqmp_conn_t
+ * for each one and registers its callback handler.
+ *
+ * in:  listener - MsQuic listener handle (unused)
+ *      ctx_ptr  - our sqmp_quic_ctx_t
+ *      ev       - listener event
+ * out: QUIC_STATUS_SUCCESS or QUIC_STATUS_OUT_OF_MEMORY
+ */
 static QUIC_STATUS QUIC_API
 listener_cb(HQUIC listener, void *ctx_ptr, QUIC_LISTENER_EVENT *ev)
 {
@@ -159,6 +189,14 @@ listener_cb(HQUIC listener, void *ctx_ptr, QUIC_LISTENER_EVENT *ev)
     return QUIC_STATUS_SUCCESS;
 }
 
+/*
+ * sqmp_quic_init
+ * Initializes the QUIC context. Opens the MsQuic API and creates a
+ * registration using the given config.
+ *
+ * in:  cfg - app name, callbacks, and idle timeout
+ * out: new context on success, NULL on failure
+ */
 sqmp_quic_ctx_t *sqmp_quic_init(const sqmp_quic_config_t *cfg)
 {
     sqmp_quic_ctx_t *ctx = calloc(1, sizeof(*ctx));
@@ -187,6 +225,13 @@ sqmp_quic_ctx_t *sqmp_quic_init(const sqmp_quic_config_t *cfg)
     return ctx;
 }
 
+/*
+ * sqmp_quic_destroy
+ * Tears down the QUIC context and frees all resources. Blocks until
+ * all active connections finish shutting down.
+ *
+ * in:  ctx - the context to destroy
+ */
 void sqmp_quic_destroy(sqmp_quic_ctx_t *ctx)
 {
     if (!ctx) return;
@@ -197,6 +242,18 @@ void sqmp_quic_destroy(sqmp_quic_ctx_t *ctx)
     free(ctx);
 }
 
+/*
+ * sqmp_quic_listen
+ * Loads the TLS cert and key, then starts the server listening on the
+ * given port with the given ALPN.
+ *
+ * in:  ctx       - QUIC context
+ *      alpn      - ALPN protocol string
+ *      port      - port to listen on
+ *      cert_file - path to TLS certificate
+ *      key_file  - path to TLS private key
+ * out: 0 on success, -1 on failure
+ */
 int sqmp_quic_listen(sqmp_quic_ctx_t *ctx,
                      const char *alpn, uint16_t port,
                      const char *cert_file, const char *key_file)
@@ -248,6 +305,17 @@ int sqmp_quic_listen(sqmp_quic_ctx_t *ctx,
     return 0;
 }
 
+/*
+ * sqmp_quic_connect
+ * Opens a connection to the server and blocks until it's established
+ * or fails.
+ *
+ * in:  ctx  - QUIC context
+ *      alpn - ALPN protocol string
+ *      host - server hostname
+ *      port - server port
+ * out: connection on success, NULL on failure
+ */
 sqmp_conn_t *sqmp_quic_connect(sqmp_quic_ctx_t *ctx,
                                 const char *alpn,
                                 const char *host, uint16_t port)
@@ -318,6 +386,13 @@ fail:
     return NULL;
 }
 
+/*
+ * sqmp_quic_disconnect
+ * Gracefully shuts down a client connection and frees it. Blocks until
+ * the shutdown completes.
+ *
+ * in:  conn - the connection to close
+ */
 void sqmp_quic_disconnect(sqmp_conn_t *conn)
 {
     if (!conn) return;
@@ -331,6 +406,13 @@ void sqmp_quic_disconnect(sqmp_conn_t *conn)
     free(conn);
 }
 
+/*
+ * sqmp_stream_open
+ * Opens a new outgoing stream on a connection.
+ *
+ * in:  conn - connection to open the stream on
+ * out: new stream on success, NULL on failure
+ */
 sqmp_stream_t *sqmp_stream_open(sqmp_conn_t *conn)
 {
     sqmp_stream_t *stream = calloc(1, sizeof(*stream));
@@ -360,6 +442,16 @@ sqmp_stream_t *sqmp_stream_open(sqmp_conn_t *conn)
     return stream;
 }
 
+/*
+ * sqmp_stream_send
+ * Queues data to be sent on a stream. Copies the data internally so
+ * the caller can free the buffer after this returns.
+ *
+ * in:  stream - stream to send on
+ *      data   - buffer to send
+ *      len    - number of bytes
+ * out: 0 on success, -1 on failure
+ */
 int sqmp_stream_send(sqmp_stream_t *stream, const uint8_t *data, size_t len)
 {
     send_buf_t *sb = malloc(sizeof(send_buf_t) + len);
@@ -378,12 +470,24 @@ int sqmp_stream_send(sqmp_stream_t *stream, const uint8_t *data, size_t len)
     return 0;
 }
 
+/*
+ * sqmp_stream_send_done
+ * Signals that we're done sending on this stream (graceful half-close).
+ *
+ * in:  stream - stream to half-close
+ */
 void sqmp_stream_send_done(sqmp_stream_t *stream)
 {
     stream->conn->ctx->msquic->StreamShutdown(
         stream->handle, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
 }
 
+/*
+ * sqmp_stream_close
+ * Gracefully shuts down and closes a stream.
+ *
+ * in:  stream - stream to close
+ */
 void sqmp_stream_close(sqmp_stream_t *stream)
 {
     stream->conn->ctx->msquic->StreamShutdown(
@@ -391,6 +495,14 @@ void sqmp_stream_close(sqmp_stream_t *stream)
     stream->conn->ctx->msquic->StreamClose(stream->handle);
 }
 
+/*
+ * sqmp_{conn,stream}_{set,get}_user_data
+ * Attach or retrieve arbitrary user data on a connection or stream.
+ *
+ * in:  c/s - connection or stream
+ *      d   - data pointer (set variants only)
+ * out: stored pointer (get variants)
+ */
 void  sqmp_conn_set_user_data  (sqmp_conn_t   *c, void *d) { c->user_data = d; }
 void *sqmp_conn_get_user_data  (sqmp_conn_t   *c)          { return c->user_data; }
 void  sqmp_stream_set_user_data(sqmp_stream_t *s, void *d) { s->user_data = d; }
