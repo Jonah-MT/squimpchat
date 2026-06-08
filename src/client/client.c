@@ -93,6 +93,9 @@ static void on_stream_recv(sqmp_stream_t *stream,
         case SQMP_MSG_TYPE_CHAT_DELIVER:
             sqmp_process_chat_deliver(stream, session, pkt);
             break;
+        case SQMP_MSG_TYPE_ERROR:
+            sqmp_process_error(stream, session, pkt);
+            break;
         case SQMP_MSG_TYPE_BYE:
             sqmp_process_bye(stream, session, pkt);
             break;
@@ -222,6 +225,30 @@ void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t
     sqmp_send_bye(stream, session);
     g_interrupted = 1;
     pthread_kill(g_main_thread, SIGINT);
+}
+
+/*
+ * sqmp_process_error
+ * Handler for MSG_ERROR. Prints the server error to the user without
+ * disrupting the readline prompt.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
+void sqmp_process_error(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
+{
+    (void)stream;
+    sqmp_msg_error_t *err = (sqmp_msg_error_t *)pkt->msg;
+    int rl_active = atomic_load(&g_readline_active);
+    if (rl_active) rl_clear_visible_line();
+    printf("[error 0x%02x] %.*s\n", err->error_code,
+           (int)err->desc_len, err->description);
+    fflush(stdout);
+    if (rl_active) rl_forced_update_display();
+
+    if (err->error_code == SQMP_ERROR_CODE_USER_NOT_FOUND && session) {
+        memset(session->key_fetch_result, 0, sizeof(session->key_fetch_result));
+        sem_post(&session->key_fetch_sem);
+    }
 }
 
 /*
@@ -481,11 +508,8 @@ static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
     }
 
     static const uint8_t zeros[32] = {0};
-    if (memcmp(session->key_fetch_result, zeros, 32) == 0) {
-        fprintf(stderr, "user '%.*s' not found or has no key\n",
-                (int)recipient_len, recipient);
+    if (memcmp(session->key_fetch_result, zeros, 32) == 0)
         return -1;
-    }
 
     uint8_t  ephemeral_pub[32];
     uint8_t  nonce[12];
@@ -636,11 +660,12 @@ int main(int argc, char *argv[])
         rl_catch_signals = 0;
         rl_event_hook    = rl_interrupt_hook;
         rl_set_keyboard_input_timeout(100000);
-        atomic_store(&g_readline_active, 1);
 
         char *line = NULL;
         while (!g_interrupted) {
+            atomic_store(&g_readline_active, 1);
             line = readline("> ");
+            atomic_store(&g_readline_active, 0);
             if (!line) break;
 
             printf("\033[1A\033[2K\r");
@@ -683,7 +708,6 @@ int main(int argc, char *argv[])
             line = NULL;
         }
         if (line) free(line);
-        atomic_store(&g_readline_active, 0);
     }
 
     printf("\nDisconnecting...\n");

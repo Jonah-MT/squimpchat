@@ -8,6 +8,8 @@
 #define SQMP_USERNAME_MAX_LEN 32
 #define SQMP_PASSWORD_HASH_LEN 32
 #define SQMP_ERROR_DESC_MAX_LEN 128
+#define SQMP_REGISTRY_MAX 64
+
 typedef struct sqmp_session_s {
     uint8_t  state;
     uint32_t session_id;
@@ -119,6 +121,14 @@ typedef struct sqmp_msg_error_s {
     uint8_t  description[SQMP_ERROR_DESC_MAX_LEN];
 } __attribute__((packed)) sqmp_msg_error_t;
 
+enum sqmp_error_code_e {
+    SQMP_ERROR_CODE_GENERAL          = 0x00,
+    SQMP_ERROR_CODE_USER_NOT_FOUND   = 0x01,
+    SQMP_ERROR_CODE_COULD_NOT_SEND   = 0x02,
+    SQMP_ERROR_CODE_VERSION_MISMATCH = 0x03,
+    SQMP_ERROR_CODE_UNEXPECTED_MSG   = 0x04,
+};
+
 typedef struct sqmp_msg_chat_send_s {
     uint8_t  recipient_len;
     uint8_t  recipient[SQMP_USERNAME_MAX_LEN];
@@ -167,17 +177,18 @@ void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
 void sqmp_process_key_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_process_key_resp(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_process_bye(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
+void sqmp_process_error(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt);
 void sqmp_send_bye(sqmp_stream_t *stream, sqmp_session_t *session);
+void sqmp_send_error(sqmp_stream_t *stream, sqmp_session_t *session, uint8_t code, const char *desc);
 void sqmp_registry_send_bye_all(void);
 void sqmp_registry_shutdown_connections(void);
 
 void sqmp_auth_queue_init(void);
 sqmp_session_t *sqmp_auth_queue_dequeue(void);
 
-#define SQMP_REGISTRY_MAX 64
-int sqmp_registry_add   (const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream, const uint8_t *pubkey);
+int sqmp_registry_add(const uint8_t *uname, uint8_t ulen, sqmp_stream_t *stream, const uint8_t *pubkey);
 void sqmp_registry_remove(const uint8_t *uname, uint8_t ulen);
 sqmp_stream_t *sqmp_registry_find  (const uint8_t *uname, uint8_t ulen);
-int            sqmp_registry_get_pubkey(const uint8_t *uname, uint8_t ulen, uint8_t pubkey_out[32]);
+int sqmp_registry_get_pubkey(const uint8_t *uname, uint8_t ulen, uint8_t pubkey_out[32]);
 
 void sqmp_dbg_recv_pkt(const sqmp_pkt_t *pkt);

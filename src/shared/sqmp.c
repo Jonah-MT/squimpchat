@@ -254,6 +254,50 @@ void sqmp_registry_shutdown_connections(void)
 }
 
 /*
+ * sqmp_send_error
+ * Builds and sends an ERROR packet on the given stream.
+ *
+ * in:  stream  - stream to send on
+ *      session - session (used for session_id; may be NULL before assignment)
+ *      code    - error code (sqmp_error_code_e)
+ *      desc    - human-readable description string (may be NULL)
+ */
+void sqmp_send_error(sqmp_stream_t *stream, sqmp_session_t *session,
+                     uint8_t code, const char *desc)
+{
+    uint8_t buf[sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_error_t)];
+    memset(buf, 0, sizeof(buf));
+    sqmp_pkt_t       *pkt = (sqmp_pkt_t *)buf;
+    sqmp_msg_error_t *err = (sqmp_msg_error_t *)pkt->msg;
+
+    pkt->version    = 1;
+    pkt->msg_type   = SQMP_MSG_TYPE_ERROR;
+    pkt->session_id = session ? session->session_id : 0;
+
+    err->error_code = code;
+    size_t dlen = desc ? strlen(desc) : 0;
+    if (dlen > SQMP_ERROR_DESC_MAX_LEN) dlen = SQMP_ERROR_DESC_MAX_LEN;
+    err->desc_len = (uint8_t)dlen;
+    if (dlen) memcpy(err->description, desc, dlen);
+
+    sqmp_stream_send(stream, buf, sizeof(buf));
+    dbg_printf("[sent] MSG_ERROR (code=0x%02x desc='%.*s')\n",
+               code, (int)dlen, desc ? desc : "");
+}
+
+/*
+ * sqmp_process_error (weak)
+ * Default no-op handler for MSG_ERROR. Overridden by client.c.
+ *
+ * in:  stream, session, pkt - standard handler args
+ */
+__attribute__((weak))
+void sqmp_process_error(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
+{
+    (void)stream; (void)session; (void)pkt;
+}
+
+/*
  * sqmp_process_hello
  * Server-side handler for MSG_HELLO. Checks that the client supports
  * version 1, assigns a session ID, and sends HELLO_ACK.
@@ -264,6 +308,7 @@ void sqmp_process_hello(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt
 {
     if (session->state != SQMP_SESSION_STATE_HELLO) {
         fprintf(stderr, "Hello received when sqmp state is %d\n", session->state);
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_UNEXPECTED_MSG, "unexpected HELLO");
         return;
     }
 
@@ -274,6 +319,9 @@ void sqmp_process_hello(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt
     }
     if (!has_v1) {
         fprintf(stderr, "Client does not support version 1\n");
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_VERSION_MISMATCH,
+                        "no supported protocol version");
+        sqmp_send_bye(stream, session);
         return;
     }
 
@@ -330,6 +378,7 @@ void sqmp_process_auth_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_
 {
     if (session->state != SQMP_SESSION_STATE_AUTH) {
         fprintf(stderr, "AUTH_REQ in unexpected state %d\n", session->state);
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_UNEXPECTED_MSG, "unexpected AUTH_REQ");
         return;
     }
     sqmp_msg_auth_req_t *auth = (sqmp_msg_auth_req_t *)pkt->msg;
@@ -395,16 +444,20 @@ void sqmp_process_chat_deliver(sqmp_stream_t *stream, sqmp_session_t *session, s
  */
 void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_pkt_t *pkt)
 {
-    (void)stream;
     sqmp_msg_chat_send_t *msg = (sqmp_msg_chat_send_t *)pkt->msg;
 
     if (session->state != SQMP_SESSION_STATE_CONN_ESTABLISHED) {
         fprintf(stderr, "CHAT_SEND in unexpected state %d\n", session->state);
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_UNEXPECTED_MSG, "unexpected CHAT_SEND");
         return;
     }
 
     sqmp_stream_t *recipient = sqmp_registry_find(msg->recipient, msg->recipient_len);
-    if (!recipient) return;
+    if (!recipient) {
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_USER_NOT_FOUND,
+                        "recipient not online");
+        return;
+    }
 
     size_t      pktlen = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_chat_deliver_t) + msg->ciphertext_len;
     sqmp_pkt_t *out    = malloc(pktlen);
@@ -425,7 +478,9 @@ void sqmp_process_chat_send(sqmp_stream_t *stream, sqmp_session_t *session, sqmp
     deliver->ciphertext_len = msg->ciphertext_len;
     memcpy(deliver->ciphertext, msg->ciphertext, msg->ciphertext_len);
 
-    sqmp_stream_send(recipient, (uint8_t *)out, pktlen);
+    if (sqmp_stream_send(recipient, (uint8_t *)out, pktlen) != 0)
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_COULD_NOT_SEND,
+                        "could not deliver message");
     dbg_printf("[sent] MSG_CHAT_DELIVER (from='%.*s' to='%.*s' ciphertext_len=%u)\n",
                (int)session->username_len, session->username,
                (int)msg->recipient_len, msg->recipient,
@@ -445,13 +500,16 @@ void sqmp_process_key_req(sqmp_stream_t *stream, sqmp_session_t *session, sqmp_p
 {
     if (session->state != SQMP_SESSION_STATE_CONN_ESTABLISHED) {
         fprintf(stderr, "KEY_REQ in unexpected state %d\n", session->state);
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_UNEXPECTED_MSG, "unexpected KEY_REQ");
         return;
     }
     sqmp_msg_key_req_t *req = (sqmp_msg_key_req_t *)pkt->msg;
 
     uint8_t pubkey[32];
-    if (sqmp_registry_get_pubkey(req->username, req->username_len, pubkey) != 0)
+    if (sqmp_registry_get_pubkey(req->username, req->username_len, pubkey) != 0) {
+        sqmp_send_error(stream, session, SQMP_ERROR_CODE_USER_NOT_FOUND, "user not found");
         return;
+    }
 
     size_t   pktlen  = sizeof(sqmp_pkt_t) + sizeof(sqmp_msg_key_resp_t) + 32;
     uint8_t *buf     = malloc(pktlen);
@@ -537,6 +595,12 @@ void sqmp_dbg_recv_pkt(const sqmp_pkt_t *pkt)
         sqmp_msg_key_resp_t *k = (sqmp_msg_key_resp_t *)pkt->msg;
         dbg_printf("[recv] MSG_KEY_RESP (for='%.*s')\n",
                    (int)k->username_len, k->username);
+        break;
+    }
+    case SQMP_MSG_TYPE_ERROR: {
+        sqmp_msg_error_t *e = (sqmp_msg_error_t *)pkt->msg;
+        dbg_printf("[recv] MSG_ERROR (code=0x%02x desc='%.*s')\n",
+                   e->error_code, (int)e->desc_len, e->description);
         break;
     }
     case SQMP_MSG_TYPE_BYE:

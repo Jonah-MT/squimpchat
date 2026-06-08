@@ -193,6 +193,9 @@ static void on_stream_recv(sqmp_stream_t *stream,
         case SQMP_MSG_TYPE_CHAT_SEND:
             sqmp_process_chat_send(stream, session, pkt);
             break;
+        case SQMP_MSG_TYPE_ERROR:
+            sqmp_process_error(stream, session, pkt);
+            break;
         case SQMP_MSG_TYPE_BYE:
             sqmp_process_bye(stream, session, pkt);
             break;
