@@ -430,8 +430,17 @@ static int send_chat(sqmp_stream_t *stream, sqmp_session_t *session,
  * main
  * --------------------------------------------------------------------------*/
 
-int main(void)
+int main(int argc, char *argv[])
 {
+    if (argc < 2) {
+        fprintf(stderr, "Not enough arguments provided.\nUsage: ./client <hostname>\n");
+        return 1;
+    } else if (argc > 2) {
+        fprintf(stderr, "Too many arguments.\nUsage: ./client <hostname>\n");
+        return 1;
+    }
+    char *host = argv[1];
+
     sqmp_session_t session = {0};
     session.state = SQMP_SESSION_STATE_HELLO;
     sem_init(&session.login_ready, 0, 0);
@@ -465,10 +474,10 @@ int main(void)
     sigaction(SIGTERM, &sa, NULL);
     pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
 
-    printf("Connecting to %s:%d...\n", SERVER_HOST, SERVER_PORT);
+    printf("Connecting to %s:%d...\n", host, SERVER_PORT);
     fflush(stdout);
 
-    sqmp_conn_t *conn = sqmp_quic_connect(ctx, CLIENT_ALPN, SERVER_HOST, SERVER_PORT);
+    sqmp_conn_t *conn = sqmp_quic_connect(ctx, CLIENT_ALPN, host, SERVER_PORT);
     if (!conn) {
         fprintf(stderr, "connection failed\n");
         sqmp_quic_destroy(ctx);
@@ -562,6 +571,9 @@ int main(void)
                 free(line); line = NULL;
                 continue;
             }
+
+            printf("[to: %.*s] %s\n", (int)recipient_len, line, msg);
+            fflush(stdout);
 
             if (send_chat(stream, &session, line, recipient_len, msg, msglen) != 0)
                 fprintf(stderr, "failed to send message\n");

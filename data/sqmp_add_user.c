@@ -23,6 +23,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if ((strcmp(username, "exit") == 0) || (strcmp(username, "quit") == 0) || (strcmp(username, "r") == 0) || (strcmp(username, "reply") == 0))
+    {
+        fprintf(stderr, "%s is a forbidden username", username);
+        return 1;
+    }
+
     FILE *f = fopen(users_file, "r");
     if (f) {
         char line[256];
