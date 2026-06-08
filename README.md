@@ -94,7 +94,9 @@ Type `quit`, `exit`, or press Ctrl+C to disconnect.
 
 ***Currently, the project only supports sending messages between connected users. Trying to send a message to a user who is not connected will result in an error***
 
+---
 
+#### Short Demo:
 ![demo](demo.gif)
 
 ---
