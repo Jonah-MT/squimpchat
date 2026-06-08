@@ -114,7 +114,7 @@ conn_cb(HQUIC handle, void *ctx_ptr, QUIC_CONNECTION_EVENT *ev)
         break;
 
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
-        if (cfg->on_disconnected)
+        if (conn->connected && cfg->on_disconnected)
             cfg->on_disconnected(conn);
 
         if (conn->is_server) {
@@ -375,6 +375,12 @@ sqmp_conn_t *sqmp_quic_connect(sqmp_quic_ctx_t *ctx,
     while (sem_wait(&conn->connect_sem) == -1 && errno == EINTR)
         ;
     if (!conn->connected) {
+        while (sem_wait(&conn->closed_sem) == -1 && errno == EINTR)
+            ;
+        ctx->msquic->ConnectionClose(conn->handle);
+        sem_destroy(&conn->connect_sem);
+        sem_destroy(&conn->closed_sem);
+        free(conn);
         return NULL;
     }
     return conn;

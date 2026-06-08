@@ -152,7 +152,7 @@ static int sqmp_login(sqmp_stream_t *stream, sqmp_session_t *session)
     tcgetattr(STDIN_FILENO, &old_t);
     new_t         = old_t;
     new_t.c_lflag &= ~(tcflag_t)ECHO;
-    tcsetattr(STDIN_FILENO, TCSAFnowLUSH, &new_t);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_t);
     char *rd = fgets(password, sizeof(password), stdin);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_t);
     printf("\n");
