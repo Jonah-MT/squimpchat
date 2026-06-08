@@ -13,6 +13,12 @@ A QUIC-based encrypted chat application written in C. Messages are end-to-end en
 | libreadline | Client terminal UI |
 | gcc, make | Build |
 
+The MsQuic library is bundled as a prebuilt binary (`lib/libmsquic.so.2`). Its runtime dependencies — `libcrypto.so.3` and `libnuma` — must be present on the system. On Ubuntu/Debian:
+
+```sh
+sudo apt install libssl-dev libnuma-dev
+```
+
 ---
 
 ## Building
